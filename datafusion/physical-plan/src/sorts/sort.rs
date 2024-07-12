@@ -291,7 +291,7 @@ impl ExternalSorter {
         self.reserve_memory_for_merge()?;
 
         let size = input.get_array_memory_size();
-        if self.reservation.try_grow(size).is_err() {
+        if self.reservation.size() + size > self.merge_reservation.size() {
             let before = self.reservation.size();
             self.in_mem_sort().await?;
             // Sorting may have freed memory, especially if fetch is `Some`
@@ -304,12 +304,12 @@ impl ExternalSorter {
             // memory required for `fetch` is just under the memory available,
             // causing repeated re-sorting of data
             if self.reservation.size() > before / 2
-                || self.reservation.try_grow(size).is_err()
+                || self.reservation.size() + size > self.merge_reservation.size()
             {
                 self.spill().await?;
-                self.reservation.try_grow(size)?
             }
         }
+        self.reservation.try_grow(size)?;
 
         self.in_mem_batches.push(input);
         self.in_mem_batches_sorted = false;
@@ -329,15 +329,65 @@ impl ExternalSorter {
     ///
     /// 2. A combined streaming merge incorporating both in-memory
     /// batches and data from spill files on disk.
-    fn sort(&mut self) -> Result<SendableRecordBatchStream> {
+    async fn sort(&mut self) -> Result<SendableRecordBatchStream> {
         if self.spilled_before() {
-            let mut streams = vec![];
-            if !self.in_mem_batches.is_empty() {
-                let in_mem_stream =
-                    self.in_mem_sort_stream(self.metrics.baseline.intermediate())?;
-                streams.push(in_mem_stream);
-            }
+            // Spill the remaining in memory batches to lower our memory usage.
+            self.spill().await?;
 
+            // Figure out the average memory usage per batch.
+            let size_per_batch =
+                self.spilled_bytes() / (self.spilled_rows() / self.batch_size);
+            // We will have 3 batches in memory for each stream. 2 because the stream buffers 2,
+            // and one because the merge stream holds one batch from each stream.
+            let max_streams =
+                std::cmp::max(self.sort_spill_reservation_bytes / size_per_batch / 3, 2);
+            if self.spills.len() > max_streams {
+                debug!("Sorting spilled more files that we can merge at once. Performing intermediate merges to reduce the number of streams from {} to {}.", self.spills.len(), max_streams);
+                // How should we merge them?
+                let mut required_reduction = self.spills.len() - max_streams;
+                // The last one might be shorter, so we should merge it first.
+                {
+                    let spill_length = self.spills.len();
+                    self.spills.swap(0, spill_length - 1);
+                }
+                while required_reduction > 0 {
+                    let n_streams_to_merge =
+                        std::cmp::min(required_reduction + 1, max_streams);
+                    let mut streams = vec![];
+                    required_reduction -= n_streams_to_merge - 1;
+                    // We take files from the front, since we will add larger files to the back.
+                    for spill in self.spills.drain(0..n_streams_to_merge) {
+                        if !spill.path().exists() {
+                            return Err(DataFusionError::Internal(format!(
+                                "Spill file {:?} does not exist",
+                                spill.path()
+                            )));
+                        }
+                        let stream = read_spill_as_stream(spill, self.schema.clone())?;
+                        streams.push(stream);
+                    }
+                    debug!("Intermediate merge sort of {} streams", streams.len());
+                    let this_merge = streaming_merge(
+                        streams,
+                        self.schema.clone(),
+                        &self.expr,
+                        self.metrics.baseline.clone(),
+                        self.batch_size,
+                        self.fetch,
+                        self.reservation.new_empty(),
+                    )?;
+                    let spill_file =
+                        self.runtime.disk_manager.create_tmp_file("Sorting")?;
+                    spill_sorted_stream(
+                        this_merge,
+                        spill_file.path(),
+                        self.schema.clone(),
+                    )
+                    .await?;
+                    self.spills.push(spill_file);
+                }
+            }
+            let mut streams = vec![];
             for spill in self.spills.drain(..) {
                 if !spill.path().exists() {
                     return Err(DataFusionError::Internal(format!(
@@ -420,6 +470,9 @@ impl ExternalSorter {
         // Release the memory reserved for merge back to the pool so
         // there is some left when `in_memo_sort_stream` requests an
         // allocation.
+
+        // This seems like a race condition if it gives the memory back to a global pool.
+        // If we want to use the merge_reservation, we should probably pass in self.merge_reservation.split(capacity)
         self.merge_reservation.free();
 
         self.in_mem_batches = self
@@ -682,6 +735,43 @@ async fn spill_sorted_batches(
         Err(e) => exec_err!("Error occurred while spilling {e}"),
     }
 }
+/// Spills a sorted stream of batches to disk.
+/// Returns number of the rows spilled to disk.
+async fn spill_sorted_stream(
+    stream: SendableRecordBatchStream,
+    path: &Path,
+    schema: SchemaRef,
+) -> Result<usize> {
+    let path: PathBuf = path.into();
+    let mut writer = IPCWriter::new(path.as_ref(), schema.as_ref())?;
+    stream
+        .try_for_each(|b| futures::future::ready(writer.write(&b)))
+        .await?;
+    writer.finish()?;
+    debug!(
+        "Spilled {} batches of total {} rows to disk, memory released {}",
+        writer.num_batches,
+        writer.num_rows,
+        human_readable_size(writer.num_bytes),
+    );
+    Ok(writer.num_rows)
+
+    // Leaving this here for reference. I'm not sure why tasks are spawned this way.
+
+    // let task = SpawnedTask::spawn_blocking(move || {
+    //     let mut writer = IPCWriter::new(path.as_ref(), schema.as_ref())?;
+    //     stream.try_for_each(|b| {
+    //         writer.write(&b)?;
+    //         futures::future::ready(Ok(()))
+    //     }).await?;
+    //     let batches = stream.try_collect().map_err(DataFusionError::into_arrow_external)?;
+    //     write_sorted(batches, path, schema)
+    // });
+    // match task.join().await {
+    //     Ok(r) => r,
+    //     Err(e) => exec_err!("Error occurred while spilling {e}"),
+    // }
+}
 
 pub(crate) fn read_spill_as_stream(
     path: RefCountedTempFile,
@@ -702,6 +792,28 @@ pub(crate) fn read_spill_as_stream(
 }
 
 fn write_sorted(
+    batches: Vec<RecordBatch>,
+    path: PathBuf,
+    schema: SchemaRef,
+) -> Result<usize> {
+    let mut writer = IPCWriter::new(path.as_ref(), schema.as_ref())?;
+    let mut max_batch_size = 0;
+    for batch in batches {
+        max_batch_size = max_batch_size.max(batch.get_array_memory_size());
+
+        writer.write(&batch)?;
+    }
+    writer.finish()?;
+    debug!(
+        "Spilled {} batches of total {} rows to disk, memory released {}",
+        writer.num_batches,
+        writer.num_rows,
+        human_readable_size(writer.num_bytes),
+    );
+    Ok(writer.num_rows)
+}
+
+fn write_sorted_stream(
     batches: Vec<RecordBatch>,
     path: PathBuf,
     schema: SchemaRef,
@@ -978,7 +1090,7 @@ impl ExecutionPlan for SortExec {
                         let batch = batch?;
                         sorter.insert_batch(batch).await?;
                     }
-                    sorter.sort()
+                    sorter.sort().await
                 })
                 .try_flatten(),
             )))
